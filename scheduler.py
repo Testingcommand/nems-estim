@@ -224,6 +224,15 @@ def assign_provider_appointments(patients, now):
             patient["Appt Time"] = ""
 
     # Assign automatic appointments in arrival order.
+    # Clear old automatic appointments before
+# calculating the new automatic schedule.
+for patient in patients:
+
+    if (
+        patient.get("Status") in PROVIDERS
+        and patient.get("Appt Mode") != "MANUAL"
+    ):
+        patient["Appt Time"] = ""
     automatic = [
         p for p in patients
         if p.get("Status") in PROVIDERS
