@@ -14,9 +14,9 @@ from config import (
 )
 
 
-# ---------------------------------------
+# ==========================================
 # PATIENT DEFAULTS
-# ---------------------------------------
+# ==========================================
 
 def new_patient(name, provider, appointment=""):
     now = datetime.now(TIMEZONE)
@@ -25,22 +25,17 @@ def new_patient(name, provider, appointment=""):
         "id": str(uuid4()),
         "Patient": name,
         "Status": provider,
-
         "Appt Time": appointment,
         "Provider Room": PROVIDERS.get(provider, ""),
         "Appt Mode": "MANUAL" if appointment else "AUTO",
-
         "Arrival": now.strftime("%H:%M"),
-
         "Estim Room": "",
         "Estim Start": "",
         "Estim Room Mode": "AUTO",
         "Estim Start Mode": "AUTO",
-
         "Next Step": "",
         "Next Step Mode": "AUTO",
         "Flow Order": "",
-
         "Estim Done": False,
         "Conflict": "",
     }
@@ -55,16 +50,15 @@ def normalize_patient(patient):
     return patient
 
 
-# ---------------------------------------
+# ==========================================
 # TIME HELPERS
-# ---------------------------------------
+# ==========================================
 
 def parse_time(value, today):
     if isinstance(value, datetime):
-        return value.replace(
-            year=today.year,
-            month=today.month,
-            day=today.day,
+        return datetime.combine(
+            today,
+            value.time(),
             tzinfo=TIMEZONE,
         )
 
@@ -83,7 +77,7 @@ def parse_time(value, today):
             tzinfo=TIMEZONE,
         )
 
-    except ValueError:
+    except (ValueError, TypeError):
         return None
 
 
@@ -117,9 +111,9 @@ def round_slot(value):
     )
 
 
-# ---------------------------------------
+# ==========================================
 # PROVIDER CONFLICT DETECTION
-# ---------------------------------------
+# ==========================================
 
 def has_provider_conflict(
     patients,
@@ -127,6 +121,7 @@ def has_provider_conflict(
     candidate,
     exclude_id=None,
 ):
+
     candidate_end = candidate + timedelta(
         minutes=PROVIDER_MINUTES
     )
@@ -166,6 +161,7 @@ def next_provider_slot(
     start,
     exclude_id=None,
 ):
+
     candidate = round_slot(start)
 
     while has_provider_conflict(
@@ -181,21 +177,18 @@ def next_provider_slot(
     return candidate
 
 
-# ---------------------------------------
+# ==========================================
 # PROVIDER SCHEDULING
-# ---------------------------------------
+# ==========================================
 
 def assign_provider_appointments(patients, now):
 
     today = now.date()
 
-    # Clear invalid provider room assignments.
+    # Assign provider rooms.
     for patient in patients:
 
         provider = patient.get("Status")
-
-        if provider == "RTL":
-            continue
 
         if provider not in PROVIDERS:
             patient["Provider Room"] = ""
@@ -203,12 +196,10 @@ def assign_provider_appointments(patients, now):
 
         patient["Provider Room"] = PROVIDERS[provider]
 
-    # Preserve valid manual appointments.
+    # Validate manual appointments.
     for patient in patients:
 
-        provider = patient.get("Status")
-
-        if provider not in PROVIDERS:
+        if patient.get("Status") not in PROVIDERS:
             continue
 
         if patient.get("Appt Mode") != "MANUAL":
@@ -223,44 +214,14 @@ def assign_provider_appointments(patients, now):
             patient["Appt Mode"] = "AUTO"
             patient["Appt Time"] = ""
 
-    # Assign automatic appointments in arrival order.
-   def assign_provider_appointments(patients, now):
-
-    today = now.date()
-
-    # Clear old automatic appointments before
-    # calculating the new automatic schedule.
+    # Preserve valid automatic appointments.
+    # Clear only invalid automatic appointments.
     for patient in patients:
 
-        if (
-            patient.get("Status") in PROVIDERS
-            and patient.get("Appt Mode") != "MANUAL"
-        ):
-            patient["Appt Time"] = ""
-
-    # Clear invalid provider room assignments.
-    for patient in patients:
-
-        provider = patient.get("Status")
-
-        if provider == "RTL":
+        if patient.get("Status") not in PROVIDERS:
             continue
 
-        if provider not in PROVIDERS:
-            patient["Provider Room"] = ""
-            continue
-
-        patient["Provider Room"] = PROVIDERS[provider]
-
-    # Preserve valid manual appointments.
-    for patient in patients:
-
-        provider = patient.get("Status")
-
-        if provider not in PROVIDERS:
-            continue
-
-        if patient.get("Appt Mode") != "MANUAL":
+        if patient.get("Appt Mode") == "MANUAL":
             continue
 
         appointment = parse_time(
@@ -269,14 +230,14 @@ def assign_provider_appointments(patients, now):
         )
 
         if not appointment:
-            patient["Appt Mode"] = "AUTO"
             patient["Appt Time"] = ""
 
-    # Assign automatic appointments in arrival order.
+    # Assign new automatic appointments.
     automatic = [
         p for p in patients
         if p.get("Status") in PROVIDERS
         and p.get("Appt Mode") != "MANUAL"
+        and not p.get("Appt Time")
     ]
 
     automatic.sort(
@@ -304,9 +265,9 @@ def assign_provider_appointments(patients, now):
         patient["Appt Mode"] = "AUTO"
 
 
-# ---------------------------------------
+# ==========================================
 # ESTIM ROOM AVAILABILITY
-# ---------------------------------------
+# ==========================================
 
 def get_room_availability(patients, today):
 
@@ -355,9 +316,9 @@ def get_room_availability(patients, today):
     return reservations
 
 
-# ---------------------------------------
-# ESTIM ROOM CONFLICTS
-# ---------------------------------------
+# ==========================================
+# ESTIM ROOM CONFLICT DETECTION
+# ==========================================
 
 def find_room_conflicts(reservations):
 
@@ -385,9 +346,9 @@ def find_room_conflicts(reservations):
     return conflicts
 
 
-# ---------------------------------------
-# ROOM AVAILABILITY
-# ---------------------------------------
+# ==========================================
+# FIND AVAILABLE ESTIM ROOM
+# ==========================================
 
 def find_available_room(
     reservations,
@@ -406,16 +367,9 @@ def find_available_room(
         ):
             continue
 
-        occupied = reservations[room]
+        candidate = preferred_start or now
 
-        candidate = (
-            preferred_start
-            if preferred_start is not None
-            else now
-        )
-
-        # Find the earliest non-overlapping interval.
-        for reservation in occupied:
+        for reservation in reservations[room]:
 
             end = candidate + timedelta(
                 minutes=ESTIM_MINUTES
@@ -439,9 +393,9 @@ def find_available_room(
     return candidates[0][1], candidates[0][0]
 
 
-# ---------------------------------------
+# ==========================================
 # WORKFLOW DETERMINATION
-# ---------------------------------------
+# ==========================================
 
 def determine_next_step(patient, now):
 
@@ -449,13 +403,12 @@ def determine_next_step(patient, now):
         return "Ready to Leave"
 
     if patient.get("Estim Done"):
+
         if patient.get("Next Step Mode") == "MANUAL":
             return patient.get("Next Step", "")
 
         if patient.get("Flow Order") == "ESTIM_FIRST":
-            return (
-                "Estim Done - Move to Provider Room"
-            )
+            return "Estim Done - Move to Provider Room"
 
         return "Estim Done - Ready to leave"
 
@@ -490,25 +443,26 @@ def determine_next_step(patient, now):
     return "Provider First"
 
 
-# ---------------------------------------
+# ==========================================
 # MAIN SCHEDULING ENGINE
-# ---------------------------------------
+# ==========================================
 
 def rebuild_schedule(patients):
 
     now = datetime.now(TIMEZONE)
     today = now.date()
 
-    # Normalize all patient records.
+    # STEP 1: Normalize patients.
     for patient in patients:
         normalize_patient(patient)
 
-    # STEP 1: RTL and invalid-provider cleanup.
+    # STEP 2: Handle RTL and invalid providers.
     for patient in patients:
 
         provider = patient.get("Status")
 
         if provider == "RTL":
+
             patient.update({
                 "Appt Time": "",
                 "Provider Room": "",
@@ -530,10 +484,10 @@ def rebuild_schedule(patients):
         if p.get("Status") in PROVIDERS
     ]
 
-    # STEP 2: Provider appointments.
+    # STEP 3: Provider scheduling.
     assign_provider_appointments(active, now)
 
-    # STEP 3: Determine workflow.
+    # STEP 4: Determine patient workflow.
     for patient in active:
 
         if not patient.get("Arrival"):
@@ -550,28 +504,26 @@ def rebuild_schedule(patients):
         ):
             patient["Flow Order"] = "ESTIM_FIRST"
 
-        if (
+        elif (
             patient["Next Step"] == "Provider First"
             and not patient.get("Flow Order")
         ):
             patient["Flow Order"] = "PROVIDER_FIRST"
 
-    # STEP 4: Clear completed assignments.
+    # STEP 5: Release completed Estim assignments.
     for patient in active:
 
-        if patient.get("Estim Done"):
+        if (
+            patient.get("Estim Done")
+            or patient.get("Next Step") == "Ready to Leave"
+        ):
+
             patient["Estim Room"] = ""
             patient["Estim Start"] = ""
             patient["Estim Room Mode"] = "AUTO"
             patient["Estim Start Mode"] = "AUTO"
 
-        if patient.get("Next Step") == "Ready to Leave":
-            patient["Estim Room"] = ""
-            patient["Estim Start"] = ""
-            patient["Estim Room Mode"] = "AUTO"
-            patient["Estim Start Mode"] = "AUTO"
-
-    # STEP 5: Assign manual room with missing start.
+    # STEP 6: Handle manual room with missing start.
     for patient in active:
 
         if patient.get("Next Step") not in (
@@ -583,95 +535,157 @@ def rebuild_schedule(patients):
         room = patient.get("Estim Room")
 
         if room in ESTIM_ROOMS and not patient.get("Estim Start"):
+
             patient["Estim Start"] = format_time(now)
             patient["Estim Start Mode"] = "MANUAL"
 
-    # STEP 6: Preserve existing valid room reservations.
+    # STEP 7: Preserve existing reservations.
     reservations = get_room_availability(
         active,
         today,
     )
 
-    # STEP 7: Auto-assign patients without rooms.
+    # STEP 8: Auto-assign new Estim patients.
+    new_estim = [
+        p for p in active
+        if p.get("Next Step") == "Estim First"
+        and not p.get("Estim Done")
+        and not p.get("Estim Room")
+    ]
 
-new_estim = [
-    p for p in active
-    if p.get("Next Step") == "Estim First"
-    and not p.get("Estim Done")
-    and not p.get("Estim Room")
-]
-
-new_estim.sort(
-    key=lambda p: (
-        parse_time(p.get("Arrival"), today) or now
+    new_estim.sort(
+        key=lambda p: (
+            parse_time(p.get("Arrival"), today)
+            or now
+        )
     )
-)
 
-for patient in new_estim:
+    for patient in new_estim:
 
-    fixed_start = None
+        fixed_start = None
 
-    if patient.get("Estim Start Mode") == "MANUAL":
-        fixed_start = parse_time(
+        if patient.get("Estim Start Mode") == "MANUAL":
+
+            fixed_start = parse_time(
+                patient.get("Estim Start"),
+                today,
+            )
+
+        if fixed_start:
+
+            choices = []
+
+            for room in ESTIM_ROOMS:
+
+                overlapping = sum(
+                    1 for reservation in reservations[room]
+                    if (
+                        fixed_start < reservation["end"]
+                        and reservation["start"] <
+                        fixed_start + timedelta(
+                            minutes=ESTIM_MINUTES
+                        )
+                    )
+                )
+
+                choices.append((overlapping, room))
+
+            choices.sort()
+
+            room = choices[0][1]
+            start = fixed_start
+
+            patient["Estim Room Mode"] = "AUTO"
+
+        else:
+
+            room, start = find_available_room(
+                reservations,
+                now,
+            )
+
+            if room is None:
+                continue
+
+            patient["Estim Start Mode"] = "AUTO"
+
+        patient["Estim Room"] = room
+        patient["Estim Start"] = format_time(start)
+
+        reservations[room].append({
+            "patient": patient.get("Patient"),
+            "patient_id": patient.get("id"),
+            "start": start,
+            "end": start + timedelta(
+                minutes=ESTIM_MINUTES
+            ),
+            "mode": patient.get("Estim Room Mode"),
+        })
+
+        reservations[room].sort(
+            key=lambda x: x["start"]
+        )
+
+    # STEP 9: Detect delayed Estim appointments.
+    for patient in active:
+
+        if patient.get("Next Step Mode") == "MANUAL":
+            continue
+
+        if patient.get("Next Step") != "Estim First":
+            continue
+
+        start = parse_time(
             patient.get("Estim Start"),
             today,
         )
 
-    if fixed_start:
-
-        # Preserve the manually selected start time.
-        # Find a room that does not conflict if possible.
-
-        choices = []
-
-        for room in ESTIM_ROOMS:
-
-            overlapping = sum(
-                1 for reservation in reservations[room]
-                if (
-                    fixed_start < reservation["end"]
-                    and reservation["start"] <
-                    fixed_start + timedelta(
-                        minutes=ESTIM_MINUTES
-                    )
-                )
-            )
-
-            choices.append((overlapping, room))
-
-        choices.sort()
-
-        room = choices[0][1]
-        start = fixed_start
-
-        patient["Estim Room"] = room
-        patient["Estim Room Mode"] = "AUTO"
-
-    else:
-
-        room, start = find_available_room(
-            reservations,
-            now,
+        appointment = parse_time(
+            patient.get("Appt Time"),
+            today,
         )
 
-        if room is None:
-            continue
+        if (
+            start
+            and appointment
+            and start + timedelta(
+                minutes=ESTIM_MINUTES
+            ) > appointment
+        ):
+            patient["Next Step"] = (
+                "Estim Room Delayed - Review"
+            )
 
-        patient["Estim Room"] = room
-        patient["Estim Start Mode"] = "AUTO"
-
-    patient["Estim Start"] = format_time(start)
-
-    reservations[room].append({
-        "patient": patient.get("Patient"),
-        "patient_id": patient.get("id"),
-        "start": start,
-        "end": start + timedelta(
-            minutes=ESTIM_MINUTES
-        ),
-        "mode": patient.get("Estim Room Mode"),
-    })
-
-    reservations[room].sort(
-        key=lambda x: x["start"]
+    # STEP 10: Detect room conflicts.
+    reservations = get_room_availability(
+        active,
+        today,
     )
+
+    conflicts = find_room_conflicts(
+        reservations
+    )
+
+    for patient in patients:
+        patient["Conflict"] = ""
+
+    for conflict in conflicts:
+
+        for patient in active:
+
+            if patient.get("id") in [
+                reservation["patient_id"]
+                for reservation in reservations[
+                    conflict["room"]
+                ]
+                if reservation["patient"] in (
+                    conflict["patient1"],
+                    conflict["patient2"],
+                )
+            ]:
+
+                patient["Conflict"] = (
+                    f"Estim Room {conflict['room']} overlap"
+                )
+
+    return patients
