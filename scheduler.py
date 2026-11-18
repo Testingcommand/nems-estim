@@ -224,15 +224,55 @@ def assign_provider_appointments(patients, now):
             patient["Appt Time"] = ""
 
     # Assign automatic appointments in arrival order.
-    # Clear old automatic appointments before
-# calculating the new automatic schedule.
-for patient in patients:
+   def assign_provider_appointments(patients, now):
 
-    if (
-        patient.get("Status") in PROVIDERS
-        and patient.get("Appt Mode") != "MANUAL"
-    ):
-        patient["Appt Time"] = ""
+    today = now.date()
+
+    # Clear old automatic appointments before
+    # calculating the new automatic schedule.
+    for patient in patients:
+
+        if (
+            patient.get("Status") in PROVIDERS
+            and patient.get("Appt Mode") != "MANUAL"
+        ):
+            patient["Appt Time"] = ""
+
+    # Clear invalid provider room assignments.
+    for patient in patients:
+
+        provider = patient.get("Status")
+
+        if provider == "RTL":
+            continue
+
+        if provider not in PROVIDERS:
+            patient["Provider Room"] = ""
+            continue
+
+        patient["Provider Room"] = PROVIDERS[provider]
+
+    # Preserve valid manual appointments.
+    for patient in patients:
+
+        provider = patient.get("Status")
+
+        if provider not in PROVIDERS:
+            continue
+
+        if patient.get("Appt Mode") != "MANUAL":
+            continue
+
+        appointment = parse_time(
+            patient.get("Appt Time"),
+            today,
+        )
+
+        if not appointment:
+            patient["Appt Mode"] = "AUTO"
+            patient["Appt Time"] = ""
+
+    # Assign automatic appointments in arrival order.
     automatic = [
         p for p in patients
         if p.get("Status") in PROVIDERS
