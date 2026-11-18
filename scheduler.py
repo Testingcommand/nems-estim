@@ -553,21 +553,61 @@ def rebuild_schedule(patients):
     )
 
     # STEP 7: Auto-assign patients without rooms.
-    new_estim = [
-        p for p in active
-        if p.get("Next Step") == "Estim First"
-        and not p.get("Estim Done")
-        and not p.get("Estim Room")
-    ]
 
-    new_estim.sort(
-        key=lambda p: (
-            parse_time(p.get("Arrival"), today)
-            or now
-        )
+new_estim = [
+    p for p in active
+    if p.get("Next Step") == "Estim First"
+    and not p.get("Estim Done")
+    and not p.get("Estim Room")
+]
+
+new_estim.sort(
+    key=lambda p: (
+        parse_time(p.get("Arrival"), today) or now
     )
+)
 
-    for patient in new_estim:
+for patient in new_estim:
+
+    fixed_start = None
+
+    if patient.get("Estim Start Mode") == "MANUAL":
+        fixed_start = parse_time(
+            patient.get("Estim Start"),
+            today,
+        )
+
+    if fixed_start:
+
+        # Preserve the manually selected start time.
+        # Find a room that does not conflict if possible.
+
+        choices = []
+
+        for room in ESTIM_ROOMS:
+
+            overlapping = sum(
+                1 for reservation in reservations[room]
+                if (
+                    fixed_start < reservation["end"]
+                    and reservation["start"] <
+                    fixed_start + timedelta(
+                        minutes=ESTIM_MINUTES
+                    )
+                )
+            )
+
+            choices.append((overlapping, room))
+
+        choices.sort()
+
+        room = choices[0][1]
+        start = fixed_start
+
+        patient["Estim Room"] = room
+        patient["Estim Room Mode"] = "AUTO"
+
+    else:
 
         room, start = find_available_room(
             reservations,
@@ -578,80 +618,20 @@ def rebuild_schedule(patients):
             continue
 
         patient["Estim Room"] = room
-        patient["Estim Start"] = format_time(start)
-        patient["Estim Room Mode"] = "AUTO"
         patient["Estim Start Mode"] = "AUTO"
 
-        reservations[room].append({
-            "patient": patient.get("Patient"),
-            "patient_id": patient.get("id"),
-            "start": start,
-            "end": start + timedelta(
-                minutes=ESTIM_MINUTES
-            ),
-            "mode": "AUTO",
-        })
+    patient["Estim Start"] = format_time(start)
 
-        reservations[room].sort(
-            key=lambda x: x["start"]
-        )
+    reservations[room].append({
+        "patient": patient.get("Patient"),
+        "patient_id": patient.get("id"),
+        "start": start,
+        "end": start + timedelta(
+            minutes=ESTIM_MINUTES
+        ),
+        "mode": patient.get("Estim Room Mode"),
+    })
 
-    # STEP 8: Detect delayed Estim rooms.
-    for patient in active:
-
-        if patient.get("Next Step Mode") == "MANUAL":
-            continue
-
-        if patient.get("Next Step") != "Estim First":
-            continue
-
-        start = parse_time(
-            patient.get("Estim Start"),
-            today,
-        )
-
-        appointment = parse_time(
-            patient.get("Appt Time"),
-            today,
-        )
-
-        if (
-            start
-            and appointment
-            and start + timedelta(
-                minutes=ESTIM_MINUTES
-            ) > appointment
-        ):
-            patient["Next Step"] = (
-                "Estim Room Delayed - Review"
-            )
-
-    # STEP 9: Detect conflicts without changing
-    # manually assigned appointments.
-    reservations = get_room_availability(
-        active,
-        today,
+    reservations[room].sort(
+        key=lambda x: x["start"]
     )
-
-    conflicts = find_room_conflicts(
-        reservations
-    )
-
-    for patient in patients:
-        patient["Conflict"] = ""
-
-    for conflict in conflicts:
-
-        for patient in active:
-
-            if patient.get("Patient") in (
-                conflict["patient1"],
-                conflict["patient2"],
-            ):
-                warning = (
-                    f"Estim Room {conflict['room']} overlap"
-                )
-
-                patient["Conflict"] = warning
-
-    return patients
