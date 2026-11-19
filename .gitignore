@@ -1,6 +1,5 @@
-
-__pycache__/
-*.pyc
-.env
-.streamlit/secrets.toml
-.DS_Store
+# NEMS local database files
+data/
+*.db
+*.db-shm
+*.db-wal
