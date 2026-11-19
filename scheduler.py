@@ -57,7 +57,6 @@ def new_patient(name, provider, appointment=""):
         "Conflict": "",
         "Provider Start": "",
         "Provider Start Mode": "AUTO",
-        "Notes": "",
     }
 
 
