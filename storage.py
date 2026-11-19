@@ -1,27 +1,29 @@
 """
-Persistent SQLite storage for the NEMS Estim board.
+SQLite persistence for one shared NEMS Estim board.
 
-For multiple staff members to share one board, all browser sessions must connect
-to this same running app server and this database file must live on persistent
-storage. Do not run separate app instances with separate local database files.
+All staff must access the SAME running app server and persistent database file.
+For multiple app replicas/instances, use a shared PostgreSQL database instead.
 """
 import json
 import os
 import sqlite3
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 
 from config import TIMEZONE
 
-# Set NEMS_ESTIM_DB to a persistent mounted path in your hosting environment.
 DB_PATH = Path(os.environ.get("NEMS_ESTIM_DB", "data/nems_estim.db"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
+class ConcurrentUpdateError(Exception):
+    """Another browser session saved a newer version of the board."""
+
+
 def _connect():
-    conn = sqlite3.connect(str(DB_PATH), timeout=20, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn = sqlite3.connect(str(DB_PATH), timeout=20)
     conn.execute("PRAGMA busy_timeout=20000")
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -32,56 +34,71 @@ def _today():
 def _initialize():
     with _connect() as conn:
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS patient_boards (
+            CREATE TABLE IF NOT EXISTS daily_board (
                 board_date TEXT PRIMARY KEY,
                 patients_json TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             )
         """)
-        conn.execute(
-            """INSERT OR IGNORE INTO patient_boards
-               (board_date, patients_json, updated_at)
-               VALUES (?, '[]', ?)""",
-            (_today(), datetime.now(TIMEZONE).isoformat()),
-        )
+        conn.execute("""
+            INSERT OR IGNORE INTO daily_board
+            (board_date, patients_json, revision, updated_at)
+            VALUES (?, '[]', 0, ?)
+        """, (_today(), datetime.now(TIMEZONE).isoformat()))
+
+
+def load_board():
+    _initialize()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT patients_json, revision FROM daily_board WHERE board_date=?",
+            (_today(),)
+        ).fetchone()
+    if row is None:
+        return [], 0
+    return json.loads(row[0]), int(row[1])
 
 
 def load_patients():
-    _initialize()
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT patients_json FROM patient_boards WHERE board_date = ?",
-            (_today(),),
-        ).fetchone()
-    if not row:
-        return []
-    return json.loads(row[0])
-
-
-def save_patients(patients):
-    _initialize()
-    payload = json.dumps(patients, ensure_ascii=False, default=str)
-    with _connect() as conn:
-        conn.execute(
-            """INSERT INTO patient_boards (board_date, patients_json, updated_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(board_date) DO UPDATE SET
-                   patients_json = excluded.patients_json,
-                   updated_at = excluded.updated_at""",
-            (_today(), payload, datetime.now(TIMEZONE).isoformat()),
-        )
-
-
-def reset_patients():
-    save_patients([])
+    patients, _ = load_board()
+    return patients
 
 
 def get_revision():
-    # Kept for compatibility with any existing code that imports this helper.
+    _, revision = load_board()
+    return revision
+
+
+def save_patients(patients, expected_revision=None):
+    """Atomic save; optionally reject stale browser edits."""
     _initialize()
+    payload = json.dumps(patients, ensure_ascii=False, default=str)
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT updated_at FROM patient_boards WHERE board_date = ?",
-            (_today(),),
+            "SELECT revision FROM daily_board WHERE board_date=?",
+            (_today(),)
         ).fetchone()
-    return row[0] if row else None
+        current = int(row[0]) if row else 0
+        if expected_revision is not None and current != expected_revision:
+            conn.rollback()
+            raise ConcurrentUpdateError(
+                "The board changed in another browser. Refresh and reapply your edit."
+            )
+        new_revision = current + 1
+        conn.execute("""
+            INSERT INTO daily_board
+            (board_date, patients_json, revision, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(board_date) DO UPDATE SET
+                patients_json=excluded.patients_json,
+                revision=excluded.revision,
+                updated_at=excluded.updated_at
+        """, (_today(), payload, new_revision, datetime.now(TIMEZONE).isoformat()))
+        conn.commit()
+    return new_revision
+
+
+def reset_patients(expected_revision=None):
+    return save_patients([], expected_revision=expected_revision)
