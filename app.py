@@ -130,8 +130,6 @@ for title, heading, description in groups:
                     st.write(estim_text)
                     if p.get("Conflict"):
                         st.error(p["Conflict"])
-                    if p.get("Notes"):
-                        st.caption(f"Note: {p['Notes']}")
                 with right:
                     if p.get("Estim Done"):
                         st.success("Estim done")
@@ -153,7 +151,6 @@ for title, heading, description in groups:
                         e_step = e2.selectbox("Next step (provider discretion)", step_options, index=step_options.index(current_step))
                         e_step_auto = st.checkbox("Let system suggest next step again", value=p.get("Next Step Mode") != "MANUAL")
                         e_estim_done = st.checkbox("Estim completed", value=bool(p.get("Estim Done")))
-                        e_notes = st.text_input("Staff note (optional)", value=p.get("Notes",""))
                         save = st.form_submit_button("Save patient", type="primary", use_container_width=True)
                     if save:
                         try:
@@ -179,7 +176,6 @@ for title, heading, description in groups:
                             target["Next Step"] = e_step
                             target["Next Step Mode"] = "AUTO" if e_step_auto else "MANUAL"
                             target["Estim Done"] = e_estim_done
-                            target["Notes"] = e_notes
                             if e_estim_done:
                                 mark_estim_done(target)
                             commit(updated, revision)
