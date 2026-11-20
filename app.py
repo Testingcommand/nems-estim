@@ -2,212 +2,233 @@ import streamlit as st
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 
-from config import APP_NAME, TIMEZONE, REFRESH_SECONDS, STATUSES, NEXT_STEPS, ESTIM_ROOMS, PROVIDERS
+from config import APP_NAME, TIMEZONE, REFRESH_SECONDS, PROVIDERS, ESTIM_ROOMS
 from storage import load_board, save_patients, reset_patients, ConcurrentUpdateError
 from scheduler import (
-    new_patient, rebuild_schedule, parse_time, display_time,
-    get_estim_conflicts, mark_estim_done
+    now_local, parse_time, format_time, display_time, normalize_patient,
+    rebuild_schedule, suggest_appointment, suggest_flow, start_estim,
+    finish_estim, mark_provider_seen
 )
 
 st.set_page_config(page_title=APP_NAME, page_icon="🏥", layout="wide")
-
-# Theme-aware colors: use Streamlit variables so both light and dark themes remain legible.
 st.markdown("""
 <style>
-.block-container {max-width: 1450px; padding-top: 1.4rem; padding-bottom: 2rem;}
+.block-container {max-width: 1450px; padding-top: 1.2rem; padding-bottom: 2rem;}
 div[data-testid="stMetric"] {border:1px solid var(--secondary-background-color);
-  border-radius:14px; padding:14px 16px; background:var(--secondary-background-color);}
-.patient-card {border:1px solid var(--secondary-background-color); border-radius:14px;
-  padding:16px; margin:8px 0 14px 0; background:var(--background-color);}
-.muted {color:var(--text-color); opacity:.72; font-size:.88rem;}
-div.stButton > button {border-radius:9px;}
+ border-radius:12px;padding:12px;background:var(--secondary-background-color);}
+div.stButton > button {border-radius:9px; min-height:2.5rem;}
 </style>
 """, unsafe_allow_html=True)
-
 st_autorefresh(interval=max(10, int(REFRESH_SECONDS))*1000, key="nems_auto_refresh")
-now = datetime.now(TIMEZONE)
-today_label = now.strftime("%A, %B %d, %Y").replace(" 0", " ")
+now = now_local()
+st.title("NEMS Estim")
+st.caption("Daily patient flow · " + now.strftime("%A, %B %d, %Y"))
 
 def commit(updated, revision):
     updated = rebuild_schedule(updated)
-    new_revision = save_patients(updated, expected_revision=revision)
-    st.session_state.board_revision = new_revision
+    st.session_state.board_revision = save_patients(updated, expected_revision=revision)
     st.rerun()
 
-def time_input(label, value, key):
-    # Text input accepts familiar AM/PM notation; convert to internal HH:MM.
-    return st.text_input(label, value=display_time(value), placeholder="9:30 AM", key=key)
+def get_copy():
+    return [dict(p) for p in patients]
+
+def patient_by_id(items, pid):
+    return next(p for p in items if str(p.get("id")) == str(pid))
 
 try:
     patients, revision = load_board()
     patients = rebuild_schedule(patients)
-except Exception:
+except Exception as exc:
     st.error("Unable to load the patient board. Check the database and hosting configuration.")
+    st.exception(exc)
     st.stop()
 
-st.title("NEMS Estim")
-st.caption(f"Daily Patient Flow · {today_label}")
-top_a, top_b = st.columns([5,1])
-with top_b:
+with st.sidebar:
+    st.subheader("Board")
     if st.button("↻ Refresh", use_container_width=True):
         st.rerun()
+    st.caption(f"Auto-refresh every {REFRESH_SECONDS} seconds")
+    st.caption(f"Revision {revision}")
 
-active = [p for p in patients if p.get("Patient") and p.get("Status") != "RTL"]
-in_estim = sum(1 for p in active if p.get("Estim Room") and not p.get("Estim Done"))
-done = sum(1 for p in patients if p.get("Estim Done") or p.get("Status") == "RTL")
-conflict_count = sum(1 for p in patients if p.get("Conflict"))
-m1,m2,m3,m4 = st.columns(4)
-m1.metric("Patients", len(active))
-m2.metric("In / Assigned to Estim", in_estim)
-m3.metric("Estim completed / leaving", done)
-m4.metric("Room conflicts", conflict_count)
-
-st.divider()
-with st.expander("＋ Add patient", expanded=False):
+# Add patient form
+with st.expander("＋ Add patient", expanded=True):
     with st.form("add_patient", clear_on_submit=True):
-        c1,c2,c3 = st.columns([2,1,1])
-        name = c1.text_input("Patient identifier / last name")
-        provider = c2.selectbox("Provider", STATUSES[:-1])
-        appt = c3.text_input("Appointment time", placeholder="10:30 AM")
-        arrival = st.text_input("Arrival time (leave blank for now)", placeholder="10:15 AM")
+        name = st.text_input("Patient last name / identifier")
+        provider = st.radio("Provider", list(PROVIDERS.keys()), horizontal=True)
+        default_appt = suggest_appointment(patients, provider, now)
+        appt_raw = st.text_input("Appointment time", value=display_time(default_appt),
+                                 help="Suggested as the next 30-minute slot for this provider. You can change it.")
+        arrival_raw = st.text_input("Arrival time", value=now.strftime("%I:%M %p").lstrip("0"),
+                                    help="Examples: 9, 930a, 2:30pm, 1430")
+        estim_needed = st.checkbox("Estim needed", value=True)
         add = st.form_submit_button("Add patient", type="primary", use_container_width=True)
     if add:
         if not name.strip():
-            st.error("Enter a patient identifier.")
+            st.error("Enter a patient last name or identifier.")
         else:
-            try:
-                appt_dt = parse_time(appt) if appt.strip() else None
-                arrival_dt = parse_time(arrival) if arrival.strip() else now
-                if appt.strip() and not appt_dt:
-                    raise ValueError("Appointment time must look like 10:30 AM.")
-                if arrival.strip() and not arrival_dt:
-                    raise ValueError("Arrival time must look like 10:15 AM.")
-                patient = new_patient(name.strip(), provider, appt_dt.strftime("%H:%M") if appt_dt else "")
-                patient["Arrival"] = arrival_dt.strftime("%H:%M")
-                commit(patients + [patient], revision)
-            except ValueError as e:
-                st.error(str(e))
-            except ConcurrentUpdateError as e:
-                st.warning(str(e))
+            appt = parse_time(appt_raw)
+            arrival = parse_time(arrival_raw)
+            if appt is None:
+                st.error("Appointment time not recognized. Try 9, 930a, 2:30pm, or 14:30.")
+            elif arrival is None:
+                st.error("Arrival time not recognized. Try 9, 930a, 2:30pm, or 14:30.")
+            else:
+                p = normalize_patient({
+                    "Patient": name.strip(), "Status": provider,
+                    "Appt Time": format_time(appt), "Arrival": format_time(arrival),
+                    "Estim Needed": estim_needed,
+                    "Stage": "Waiting for Estim" if estim_needed else "Waiting for Provider",
+                })
+                p["Flow Suggestion"] = suggest_flow(p["Appt Time"], p["Arrival"])
+                if p["Flow Suggestion"] == "Provider First":
+                    p["Stage"] = "Waiting for Provider" if estim_needed else "Waiting for Provider"
+                if not estim_needed:
+                    p["Stage"] = "Waiting for Provider"
+                try:
+                    commit(patients + [p], revision)
+                except ConcurrentUpdateError as exc:
+                    st.warning(str(exc))
 
-# Main board grouped by suggested/current patient flow.
-st.subheader("Patient flow")
-st.caption("The suggested flow is a starting point. Provider discretion takes priority; use Edit to override any patient.")
-
-groups = [
-    ("Estim First", "Estim first", "Patients assigned to Estim before seeing the provider."),
-    ("Provider First", "Provider first", "Patients waiting to see their provider first."),
-    ("Estim in Progress", "Estim in progress", "Patients currently using an Estim room."),
-    ("Estim Done - Move to Provider Room", "Estim completed", "Patients who finished Estim and should move to the provider."),
-    ("Review - Provider Discretion", "Needs provider review", "Cases where staff should decide the next step."),
-    ("Review - Over 60 Min Early", "Arrived very early", "Review timing with the provider."),
-    ("Estim Room Delayed - Review", "Estim delayed", "Estim timing needs attention."),
-    ("Ready to Leave", "Ready to leave", "Patients marked as finished."),
-]
-# Include any additional manual next-step labels under an Other group.
-known = {g[0] for g in groups}
-for title, heading, description in groups:
-    members = [p for p in patients if p.get("Patient") and p.get("Next Step") == title]
-    if not members:
-        continue
-    with st.expander(f"{heading} · {len(members)}", expanded=True):
-        st.caption(description)
-        for p in members:
-            pid = str(p.get("id"))
-            with st.container(border=True):
-                left, right = st.columns([4,1])
-                with left:
-                    st.markdown(f"**{p.get('Patient','')}**")
-                    st.caption(
-                        f"{p.get('Status','')} · Provider room {p.get('Provider Room') or '—'} · "
-                        f"Appointment {display_time(p.get('Appt Time')) or '—'} · "
-                        f"Arrived {display_time(p.get('Arrival')) or '—'}"
-                    )
-                    estim_text = (
-                        f"Estim room {p.get('Estim Room')} · {display_time(p.get('Estim Start'))}"
-                        if p.get("Estim Room") else "No Estim room assigned"
-                    )
-                    st.write(estim_text)
-                    if p.get("Conflict"):
-                        st.error(p["Conflict"])
-                with right:
-                    if p.get("Estim Done"):
-                        st.success("Estim done")
-                    elif p.get("Estim Room"):
-                        st.info("Estim assigned")
-                    else:
-                        st.caption("Not in Estim")
-                with st.expander("Edit patient / manual override"):
-                    with st.form(f"edit_{pid}"):
-                        e1,e2 = st.columns(2)
-                        e_name = e1.text_input("Patient", value=p.get("Patient",""))
-                        e_provider = e2.selectbox("Provider", STATUSES, index=STATUSES.index(p.get("Status")) if p.get("Status") in STATUSES else 0)
-                        e_appt = time_input("Appointment time", p.get("Appt Time"), f"appt_{pid}")
-                        e_arrival = time_input("Arrival time", p.get("Arrival"), f"arrival_{pid}")
-                        e_room = e1.selectbox("Estim room", ["Auto", *ESTIM_ROOMS], index=(["Auto", *ESTIM_ROOMS].index(p.get("Estim Room")) if p.get("Estim Room") in ESTIM_ROOMS else 0))
-                        e_estim_start = time_input("Estim start time", p.get("Estim Start"), f"estim_{pid}")
-                        current_step = p.get("Next Step") or "Provider First"
-                        step_options = list(dict.fromkeys(NEXT_STEPS + [current_step]))
-                        e_step = e2.selectbox("Next step (provider discretion)", step_options, index=step_options.index(current_step))
-                        e_step_auto = st.checkbox("Let system suggest next step again", value=p.get("Next Step Mode") != "MANUAL")
-                        e_estim_done = st.checkbox("Estim completed", value=bool(p.get("Estim Done")))
-                        save = st.form_submit_button("Save patient", type="primary", use_container_width=True)
-                    if save:
-                        try:
-                            updated = [dict(x) for x in patients]
-                            target = next(x for x in updated if str(x.get("id")) == pid)
-                            if not e_name.strip():
-                                raise ValueError("Patient identifier cannot be blank.")
-                            target["Patient"] = e_name.strip()
-                            target["Status"] = e_provider
-                            for field, raw in [("Appt Time", e_appt), ("Arrival", e_arrival), ("Estim Start", e_estim_start)]:
-                                parsed = parse_time(raw) if raw.strip() else None
-                                if raw.strip() and not parsed:
-                                    raise ValueError(f"Invalid time for {field}. Use 9:30 AM.")
-                                target[field] = parsed.strftime("%H:%M") if parsed else ""
-                            target["Appt Mode"] = "MANUAL" if target["Appt Time"] else "AUTO"
-                            if e_room == "Auto":
-                                target["Estim Room"] = ""
-                                target["Estim Room Mode"] = "AUTO"
-                            else:
-                                target["Estim Room"] = int(e_room)
-                                target["Estim Room Mode"] = "MANUAL"
-                            target["Estim Start Mode"] = "MANUAL" if target["Estim Start"] else "AUTO"
-                            target["Next Step"] = e_step
-                            target["Next Step Mode"] = "AUTO" if e_step_auto else "MANUAL"
-                            target["Estim Done"] = e_estim_done
-                            if e_estim_done:
-                                mark_estim_done(target)
-                            commit(updated, revision)
-                        except (ValueError, StopIteration) as e:
-                            st.error(str(e))
-                        except ConcurrentUpdateError as e:
-                            st.warning(str(e))
-                if p.get("Estim Room") and not p.get("Estim Done"):
-                    if st.button("✓ Mark Estim done", key=f"done_{pid}"):
-                        updated = [dict(x) for x in patients]
-                        target = next(x for x in updated if str(x.get("id")) == pid)
-                        mark_estim_done(target)
-                        try:
-                            commit(updated, revision)
-                        except ConcurrentUpdateError as e:
-                            st.warning(str(e))
-
-other = [p for p in patients if p.get("Patient") and p.get("Next Step") not in known]
-if other:
-    with st.expander(f"Other / unclassified · {len(other)}", expanded=True):
-        for p in other:
-            st.write(f"**{p.get('Patient')}** — {p.get('Next Step') or 'No next step'}")
+# counts
+active = [p for p in patients if p.get("Patient") and p.get("Stage") != "Ready to Leave"]
+in_estim = sum(p.get("Stage") == "Estim in Progress" for p in active)
+ready = sum(p.get("Stage") == "Ready to Leave" for p in patients)
+conflicts = sum(bool(p.get("Conflict")) for p in patients)
+m1,m2,m3,m4 = st.columns(4)
+m1.metric("Active patients", len(active))
+m2.metric("Estim in progress", in_estim)
+m3.metric("Ready to leave", ready)
+m4.metric("Room conflicts", conflicts)
 
 st.divider()
+st.subheader("Patient flow")
+st.caption("Use the action buttons to move each patient through the visit. Provider discretion always takes priority.")
+
+# Ready to leave is deliberately shown first so finished patients do not disappear at the bottom.
+sections = [
+    ("Ready to Leave", "Ready to leave"),
+    ("Estim in Progress", "Estim in progress"),
+    ("Waiting for Estim", "Waiting for Estim"),
+    ("Waiting for Provider", "Waiting for Provider"),
+]
+for stage, heading in sections:
+    members = [p for p in patients if p.get("Patient") and p.get("Stage") == stage]
+    if not members:
+        continue
+    with st.container():
+        st.markdown(f"### {heading} · {len(members)}")
+        for p in members:
+            pid = p["id"]
+            with st.container(border=True):
+                c1,c2 = st.columns([4,2])
+                with c1:
+                    st.markdown(f"**{p.get('Patient')}**")
+                    st.caption(
+                        f"{p.get('Status')} · Provider room {p.get('Provider Room') or '—'} · "
+                        f"Appt {display_time(p.get('Appt Time')) or '—'} · "
+                        f"Arrived {display_time(p.get('Arrival')) or '—'}"
+                    )
+                    details = []
+                    if p.get("Estim Needed"):
+                        details.append("Estim room " + (str(p.get("Estim Room")) if p.get("Estim Room") else "—"))
+                        if p.get("Actual Estim Start"):
+                            details.append("Started " + display_time(p["Actual Estim Start"]))
+                        if p.get("Actual Estim End"):
+                            details.append("Ended " + display_time(p["Actual Estim End"]))
+                    else:
+                        details.append("Provider-only visit")
+                    if p.get("Provider Seen"):
+                        details.append("Provider seen " + (display_time(p.get("Provider Seen At")) or ""))
+                    st.caption(" · ".join(details))
+                    if p.get("Conflict"):
+                        st.error("Room conflict: " + p["Conflict"])
+                with c2:
+                    if stage == "Waiting for Estim":
+                        if st.button("▶ Start Estim", key=f"start_{pid}", type="primary", use_container_width=True):
+                            updated = get_copy()
+                            target = patient_by_id(updated, pid)
+                            try:
+                                start_estim(updated, target)
+                                commit(updated, revision)
+                            except ValueError as exc:
+                                st.warning(str(exc))
+                    elif stage == "Estim in Progress":
+                        if st.button("✓ Mark Estim complete", key=f"finish_{pid}", type="primary", use_container_width=True):
+                            updated = get_copy()
+                            finish_estim(patient_by_id(updated, pid))
+                            try:
+                                commit(updated, revision)
+                            except ConcurrentUpdateError as exc:
+                                st.warning(str(exc))
+                    elif stage == "Waiting for Provider":
+                        if st.button("✓ Provider seen", key=f"provider_{pid}", type="primary", use_container_width=True):
+                            updated = get_copy()
+                            mark_provider_seen(patient_by_id(updated, pid))
+                            try:
+                                commit(updated, revision)
+                            except ConcurrentUpdateError as exc:
+                                st.warning(str(exc))
+                    else:
+                        st.success("Visit steps complete")
+                with st.expander("Edit / override"):
+                    with st.form(f"edit_{pid}"):
+                        e_name = st.text_input("Patient identifier", value=p.get("Patient",""))
+                        e_provider = st.radio("Provider", list(PROVIDERS.keys()),
+                                              index=list(PROVIDERS).index(p["Status"]) if p.get("Status") in PROVIDERS else 0,
+                                              horizontal=True, key=f"provider_edit_{pid}")
+                        e_appt = st.text_input("Appointment time", value=display_time(p.get("Appt Time")))
+                        e_arrival = st.text_input("Arrival time", value=display_time(p.get("Arrival")))
+                        e_estim = st.checkbox("Estim needed", value=bool(p.get("Estim Needed", True)))
+                        stage_options = ["Waiting for Estim","Estim in Progress","Waiting for Provider","Ready to Leave"]
+                        e_stage = st.radio("Current stage", stage_options,
+                                           index=stage_options.index(stage) if stage in stage_options else 0,
+                                           horizontal=False, key=f"stage_{pid}")
+                        e_room = st.selectbox("Estim room (for active Estim)", ["Auto", *ESTIM_ROOMS],
+                                              index=(["Auto", *ESTIM_ROOMS].index(p.get("Estim Room"))
+                                                     if p.get("Estim Room") in ESTIM_ROOMS else 0),
+                                              key=f"room_{pid}")
+                        save = st.form_submit_button("Save changes", type="primary", use_container_width=True)
+                    if save:
+                        ap = parse_time(e_appt); ar = parse_time(e_arrival)
+                        if not e_name.strip() or ap is None or ar is None:
+                            st.error("Enter a patient identifier and valid appointment and arrival times.")
+                        else:
+                            updated = get_copy()
+                            target = patient_by_id(updated, pid)
+                            target.update({
+                                "Patient": e_name.strip(), "Status": e_provider,
+                                "Provider Room": PROVIDERS[e_provider],
+                                "Appt Time": format_time(ap), "Arrival": format_time(ar),
+                                "Estim Needed": e_estim, "Stage": e_stage,
+                                "Estim Room": "" if e_room == "Auto" else e_room,
+                            })
+                            if not e_estim:
+                                target["Estim Room"] = ""
+                                target["Estim Done"] = True
+                                target["Stage"] = "Ready to Leave" if target.get("Provider Seen") else "Waiting for Provider"
+                            if e_stage == "Estim in Progress" and not target.get("Actual Estim Start"):
+                                target["Actual Estim Start"] = now_local().strftime("%H:%M")
+                                if e_room == "Auto":
+                                    occupied = {x.get("Estim Room") for x in updated if x.get("id") != pid and x.get("Stage") == "Estim in Progress"}
+                                    target["Estim Room"] = next((r for r in ESTIM_ROOMS if r not in occupied), "")
+                            if e_stage == "Ready to Leave":
+                                target["Provider Seen"] = True
+                            try:
+                                commit(updated, revision)
+                            except ConcurrentUpdateError as exc:
+                                st.warning(str(exc))
+
+# Provider-only and post-Estim actions: when a patient is waiting for provider, staff can also start Estim
+# after marking provider seen. This is how Provider First visits proceed.
+st.divider()
 with st.expander("Daily administration"):
-    st.warning("Reset clears the shared board for all staff using this database.")
-    confirm = st.checkbox("I understand this clears today's patient board.")
+    st.warning("Reset clears the shared board for everyone using this database.")
+    confirm = st.checkbox("I understand this clears today's board.")
     if st.button("Reset today's board", disabled=not confirm):
         try:
             reset_patients(expected_revision=revision)
             st.rerun()
-        except ConcurrentUpdateError as e:
-            st.warning(str(e))
+        except ConcurrentUpdateError as exc:
+            st.warning(str(exc))
 
-st.caption(f"Shared board · Refreshes every {REFRESH_SECONDS} seconds · Database revision {revision}")
+st.caption("Operational workflow tracker only. Use approved systems for clinical documentation.")
