@@ -7,11 +7,13 @@ from config import (
     EARLY_MINUTES, MAX_EARLY_MINUTES, TIMEZONE
 )
 
-FLOW_STAGES = [
+STAGES = [
     "Waiting for Estim",
     "Estim in Progress",
+    "Move to Provider",
     "Waiting for Provider",
     "Ready to Leave",
+    "Completed",
 ]
 
 def now_local():
@@ -26,8 +28,8 @@ def parse_time(value, day=None):
     raw = str(value).strip().upper().replace(".", "")
     if not raw:
         return None
-    day = day or now_local().date()
     raw = re.sub(r"\s+", "", raw)
+    day = day or now_local().date()
     suffix = ""
     if raw.endswith(("AM", "PM")):
         suffix, raw = raw[-2:], raw[:-2]
@@ -36,20 +38,22 @@ def parse_time(value, day=None):
         raw = raw[:-1]
     try:
         if ":" in raw:
-            fmt = "%H:%M" if not suffix else "%I:%M%p"
-            parsed = datetime.strptime(raw + suffix, fmt)
+            if suffix:
+                parsed = datetime.strptime(raw + suffix, "%I:%M%p")
+            else:
+                parsed = datetime.strptime(raw, "%H:%M")
         elif raw.isdigit() and len(raw) <= 2:
             hour = int(raw)
-            if not 0 <= hour <= 23:
-                return None
             if suffix:
-                parsed = datetime.strptime(f"{hour}{suffix}", "%I%p")
+                parsed = datetime.strptime(f"{hour}:00{suffix}", "%I:%M%p")
             elif hour == 12:
                 parsed = datetime.strptime("12:00PM", "%I:%M%p")
-            elif hour <= 11:
-                parsed = datetime.strptime(f"{hour}:00", "%I:%M")
-            else:
+            elif 0 <= hour <= 11:
                 parsed = datetime.strptime(f"{hour}:00", "%H:%M")
+            elif 13 <= hour <= 23:
+                parsed = datetime.strptime(f"{hour}:00", "%H:%M")
+            else:
+                return None
         elif raw.isdigit() and len(raw) in (3, 4):
             digits = raw.zfill(4)
             hour, minute = int(digits[:-2]), int(digits[-2:])
@@ -76,112 +80,150 @@ def display_time(value):
     parsed = parse_time(value)
     return parsed.strftime("%I:%M %p").lstrip("0") if parsed else (value or "")
 
-def normalize_patient(p):
-    legacy_stage = p.get("Stage")
-    legacy_next_step = p.get("Next Step", "")
-    legacy_estim_done = p.get("Estim Done", False)
+def normalize_patient(patient):
+    patient.setdefault("id", str(uuid4()))
     defaults = {
-        "id": str(uuid4()), "Patient": "", "Status": "", "Provider Room": "",
-        "Appt Time": "", "Appt Mode": "AUTO", "Arrival": "",
-        "Estim Needed": True, "Stage": "Waiting for Estim",
-        "Estim Room": "", "Actual Estim Start": "", "Actual Estim End": "",
-        "Provider Seen": False, "Provider Seen At": "",
-        "Flow Suggestion": "Estim First", "Conflict": "",
+        "Patient": "",
+        "Status": "",
+        "Provider Room": "",
+        "Appt Time": "",
+        "Arrival": "",
+        "Estim Needed": True,
+        "Stage": "Waiting for Estim",
+        "Estim Room": "",
+        "Actual Estim Start": "",
+        "Actual Estim End": "",
+        "Provider Seen": False,
+        "Provider Seen At": "",
+        "Patient Moved": False,
+        "Patient Moved At": "",
+        "Estim Done": False,
+        "Flow Suggestion": "Estim First",
+        "Conflict": "",
+        "Created At": now_local().strftime("%H:%M"),
     }
-    for k, v in defaults.items():
-        p.setdefault(k, v)
-    if p.get("Status") in PROVIDERS:
-        p["Provider Room"] = PROVIDERS[p["Status"]]
-    # Migrate v3 records without losing the patient's current progress.
-    if not legacy_stage:
-        if legacy_estim_done:
-            p["Stage"] = "Ready to Leave" if p.get("Provider Seen") else "Waiting for Provider"
-        elif legacy_next_step == "Estim in Progress":
-            p["Stage"] = "Estim in Progress"
-        elif legacy_next_step == "Provider First":
-            p["Stage"] = "Waiting for Provider"
-        elif legacy_next_step == "Ready to Leave":
-            p["Stage"] = "Ready to Leave"
+    for key, value in defaults.items():
+        patient.setdefault(key, value)
+
+    # Migrate older v4 records while preserving their current progress.
+    # In v4.1, Estim-first patients were stored as "Waiting for Provider"
+    # immediately after Estim finished. Promote those records to the explicit handoff stage.
+    if (patient.get("Stage") == "Waiting for Provider"
+            and patient.get("Estim Needed", True)
+            and patient.get("Estim Done")
+            and not patient.get("Provider Seen")):
+        patient["Stage"] = "Move to Provider"
+    if patient.get("Stage") not in STAGES:
+        if patient.get("Estim Done"):
+            patient["Stage"] = "Ready to Leave" if patient.get("Provider Seen") else "Move to Provider"
+        elif patient.get("Actual Estim Start"):
+            patient["Stage"] = "Estim in Progress"
+        elif patient.get("Provider Seen"):
+            patient["Stage"] = "Waiting for Estim" if patient.get("Estim Needed", True) else "Ready to Leave"
         else:
-            p["Stage"] = "Waiting for Estim"
-    if p.get("Estim Done") and not p.get("Actual Estim End"):
-        p["Actual Estim End"] = p.get("Estim End", "")
-    return p
+            patient["Stage"] = "Waiting for Estim" if patient.get("Estim Needed", True) else "Waiting for Provider"
+
+    if patient.get("Status") in PROVIDERS:
+        patient["Provider Room"] = PROVIDERS[patient["Status"]]
+    if patient.get("Estim Done") and not patient.get("Actual Estim End"):
+        patient["Actual Estim End"] = patient.get("Estim End", "")
+    return patient
 
 def suggest_appointment(patients, provider, now=None):
-    """Suggest the next 30-minute slot after the latest appointment for this provider."""
     now = now or now_local()
-    times = [parse_time(p.get("Appt Time"), now.date()) for p in patients
-             if p.get("Status") == provider and p.get("Appt Time")]
-    times = [t for t in times if t]
+    times = [
+        parse_time(p.get("Appt Time"), now.date())
+        for p in patients
+        if p.get("Status") == provider and p.get("Appt Time")
+    ]
+    times = [value for value in times if value]
     if times:
         candidate = max(times) + timedelta(minutes=PROVIDER_MINUTES)
     else:
         candidate = now.replace(second=0, microsecond=0)
         remainder = candidate.minute % 30
         if remainder:
-            candidate += timedelta(minutes=30-remainder)
+            candidate += timedelta(minutes=30 - remainder)
     return format_time(candidate)
 
 def suggest_flow(appt, arrival, now=None):
     now = now or now_local()
-    a, b = parse_time(appt, now.date()), parse_time(arrival, now.date())
-    if not a or not b:
-        return "Provider First"
-    early = (a-b).total_seconds()/60
-    if early > MAX_EARLY_MINUTES:
+    appointment = parse_time(appt, now.date())
+    arrived = parse_time(arrival, now.date())
+    if not appointment or not arrived:
         return "Review timing"
-    return "Estim First" if early >= EARLY_MINUTES else "Provider First"
+    early_by = (appointment - arrived).total_seconds() / 60
+    if early_by > MAX_EARLY_MINUTES:
+        return "Review timing"
+    if early_by >= EARLY_MINUTES:
+        return "Estim First"
+    return "Provider First"
 
-def _overlap(a, b, c, d):
-    return a < d and c < b
-
-def get_estim_conflicts(patients):
-    reservations = []
-    day = now_local().date()
-    for p in patients:
-        if p.get("Stage") != "Estim in Progress":
-            continue
-        start = parse_time(p.get("Actual Estim Start"), day)
-        room = p.get("Estim Room")
-        if start and room in ESTIM_ROOMS:
-            reservations.append((p, room, start, start + timedelta(minutes=ESTIM_MINUTES)))
-    conflicts = {}
-    for i, (p1, r1, s1, e1) in enumerate(reservations):
-        for p2, r2, s2, e2 in reservations[i+1:]:
-            if r1 == r2 and _overlap(s1, e1, s2, e2):
-                conflicts.setdefault(p1["id"], []).append(
-                    f"Room {r1} overlaps with {p2.get('Patient','another patient')} ({display_time(format_time(s2))})")
-                conflicts.setdefault(p2["id"], []).append(
-                    f"Room {r2} overlaps with {p1.get('Patient','another patient')} ({display_time(format_time(s1))})")
-    return conflicts
+def arrival_message(patient, now=None):
+    now = now or now_local()
+    appointment = parse_time(patient.get("Appt Time"), now.date())
+    arrival = parse_time(patient.get("Arrival"), now.date())
+    if not appointment or not arrival:
+        return ""
+    difference = (appointment - arrival).total_seconds() / 60
+    if difference > MAX_EARLY_MINUTES:
+        return f"Arrived {int(difference)} min early — review timing"
+    if difference < 0:
+        return f"Arrived {int(abs(difference))} min after appointment"
+    if difference >= EARLY_MINUTES:
+        return f"Arrived {int(difference)} min early"
+    return "Arrived close to appointment time"
 
 def assign_estim_room(patients, patient):
-    """Choose a room not currently occupied by another Estim-in-progress patient."""
-    occupied = {p.get("Estim Room") for p in patients
-                if p.get("id") != patient.get("id") and p.get("Stage") == "Estim in Progress"}
+    occupied = {
+        p.get("Estim Room")
+        for p in patients
+        if p.get("id") != patient.get("id") and p.get("Stage") == "Estim in Progress"
+    }
     return next((room for room in ESTIM_ROOMS if room not in occupied), None)
 
+def _overlap(start_a, end_a, start_b, end_b):
+    return start_a < end_b and start_b < end_a
+
+def get_estim_conflicts(patients, now=None):
+    now = now or now_local()
+    reservations = []
+    for patient in patients:
+        if patient.get("Stage") != "Estim in Progress":
+            continue
+        start = parse_time(patient.get("Actual Estim Start"), now.date())
+        room = patient.get("Estim Room")
+        if start and room in ESTIM_ROOMS:
+            # Active sessions occupy their room until staff marks Estim complete.
+            expected_end = max(start + timedelta(minutes=ESTIM_MINUTES), now)
+            reservations.append((patient, room, start, expected_end))
+    conflicts = {}
+    for index, (p1, room1, start1, end1) in enumerate(reservations):
+        for p2, room2, start2, end2 in reservations[index + 1:]:
+            if room1 == room2 and _overlap(start1, end1, start2, end2):
+                conflicts.setdefault(p1["id"], []).append(
+                    f"Room {room1} also assigned to {p2.get('Patient', 'another patient')}"
+                )
+                conflicts.setdefault(p2["id"], []).append(
+                    f"Room {room2} also assigned to {p1.get('Patient', 'another patient')}"
+                )
+    return conflicts
+
 def rebuild_schedule(patients):
-    for p in patients:
-        normalize_patient(p)
-        if p.get("Status") in PROVIDERS:
-            p["Provider Room"] = PROVIDERS[p["Status"]]
-        if not p.get("Arrival"):
-            p["Arrival"] = now_local().strftime("%H:%M")
-        p["Conflict"] = ""
+    for patient in patients:
+        normalize_patient(patient)
+        patient["Conflict"] = ""
     conflicts = get_estim_conflicts(patients)
-    for p in patients:
-        p["Conflict"] = "; ".join(conflicts.get(p.get("id"), []))
+    for patient in patients:
+        patient["Conflict"] = "; ".join(conflicts.get(patient.get("id"), []))
     return patients
 
 def start_estim(patients, patient):
     room = assign_estim_room(patients, patient)
     if room is None:
-        raise ValueError("All Estim rooms are currently occupied. Finish or release a room first.")
-    now = now_local()
+        raise ValueError("All Estim rooms are occupied. Complete an active session or check room assignments.")
     patient["Estim Room"] = room
-    patient["Actual Estim Start"] = now.strftime("%H:%M")
+    patient["Actual Estim Start"] = now_local().strftime("%H:%M")
     patient["Actual Estim End"] = ""
     patient["Estim Done"] = False
     patient["Stage"] = "Estim in Progress"
@@ -191,7 +233,13 @@ def finish_estim(patient):
     patient["Estim Done"] = True
     patient["Actual Estim End"] = now_local().strftime("%H:%M")
     patient["Estim Room"] = ""
-    patient["Stage"] = "Ready to Leave" if patient.get("Provider Seen") or not patient.get("Estim Needed", True) else "Waiting for Provider"
+    patient["Stage"] = "Ready to Leave" if patient.get("Provider Seen") else "Move to Provider"
+    return patient
+
+def mark_patient_moved(patient):
+    patient["Patient Moved"] = True
+    patient["Patient Moved At"] = now_local().strftime("%H:%M")
+    patient["Stage"] = "Waiting for Provider"
     return patient
 
 def mark_provider_seen(patient):
@@ -199,6 +247,26 @@ def mark_provider_seen(patient):
     patient["Provider Seen At"] = now_local().strftime("%H:%M")
     if not patient.get("Estim Needed", True) or patient.get("Estim Done"):
         patient["Stage"] = "Ready to Leave"
-    elif patient.get("Stage") != "Estim in Progress":
+    elif patient.get("Stage") == "Estim in Progress":
+        # Provider saw the patient while Estim was still in progress.
+        patient["Stage"] = "Estim in Progress"
+    else:
         patient["Stage"] = "Waiting for Estim"
     return patient
+
+def mark_completed(patient):
+    patient["Stage"] = "Completed"
+    patient["Completed At"] = now_local().strftime("%H:%M")
+    return patient
+
+def reopen_patient(patient):
+    patient["Stage"] = "Ready to Leave"
+    patient.pop("Completed At", None)
+    return patient
+
+def room_status(patients):
+    occupied = {}
+    for patient in patients:
+        if patient.get("Stage") == "Estim in Progress" and patient.get("Estim Room"):
+            occupied[patient["Estim Room"]] = patient.get("Patient", "Occupied")
+    return {room: occupied.get(room) for room in ESTIM_ROOMS}
